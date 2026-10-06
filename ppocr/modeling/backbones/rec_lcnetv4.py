@@ -635,10 +635,12 @@ class PPLCNetV4(nn.Layer):
             x = self.blocks5(x)
             x = self.blocks6(x)
             if self.training:
-                x = F.adaptive_avg_pool2d(x, [1, 40])
+                #x = F.adaptive_avg_pool2d(x, [1, 40])
+                x = F.avg_pool2d(x, [x.shape[2], 2])
             else:
                 assert x.shape[2] >= 3, f"Feature height {x.shape[2]} < pool kernel 3."
-                x = F.avg_pool2d(x, [3, 2])
+                #x = F.avg_pool2d(x, [3, 2])
+                x = F.avg_pool2d(x, [x.shape[2], 2])
             return x
 
     def rep(self, fuse_lab=None):

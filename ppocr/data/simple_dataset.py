@@ -28,6 +28,10 @@ from paddle.io import Dataset
 from .imaug import transform, create_operators
 from paddle import get_device
 
+import io
+from pathlib import Path
+from .sd19_alphanumeric_line_generator_seek import generate_sample_image
+
 # ------------------------------------------------------------------ #
 #  Per-worker-process URL prefetch cache
 #
@@ -216,8 +220,8 @@ class SimpleDataSet(Dataset):
             self.file_boundaries = None
             self.data_lines = self.get_image_info_list(label_file_list, ratio_list)
             self.data_idx_order_list = list(range(len(self.data_lines)))
-            if self.mode == "train" and self.do_shuffle:
-                self.shuffle_data_random()
+            #if self.mode == "train" and self.do_shuffle:
+            #    self.shuffle_data_random()
 
         # Shared epoch value: workers read this via shared memory to detect epoch changes
         self._shared_epoch = multiprocessing.Value("i", seed if seed is not None else 0)
@@ -259,14 +263,14 @@ class SimpleDataSet(Dataset):
             end = self.file_boundaries[i + 1]
             file_size = end - start
             count = round(file_size * self.ratio_list[i])
-            if self.mode == "train" or self.ratio_list[i] < 1.0:
+            if self.ratio_list[i] < 1.0:
                 random.seed(seed)
                 sampled.extend(random.sample(range(start, end), count))
             else:
                 sampled.extend(range(start, end))
-        if self.mode == "train" and self.do_shuffle:
-            random.seed(seed)
-            random.shuffle(sampled)
+        #if self.mode == "train" and self.do_shuffle:
+        #    random.seed(seed)
+        #    random.shuffle(sampled)
         return sampled
 
     def _ensure_index_map(self):
@@ -294,7 +298,7 @@ class SimpleDataSet(Dataset):
         for idx, file in enumerate(file_list):
             with open(file, "rb") as f:
                 lines = f.readlines()
-                if self.mode == "train" or ratio_list[idx] < 1.0:
+                if ratio_list[idx] < 1.0:
                     random.seed(self.seed)
                     lines = random.sample(lines, round(len(lines) * ratio_list[idx]))
                 data_lines.extend(lines)
@@ -330,8 +334,8 @@ class SimpleDataSet(Dataset):
                 self.label_file_list, self.ratio_list
             )
             self.data_idx_order_list = list(range(len(self.data_lines)))
-            if self.mode == "train" and self.do_shuffle:
-                self.shuffle_data_random()
+            #if self.mode == "train" and self.do_shuffle:
+            #    self.shuffle_data_random()
 
     # ------------------------------------------------------------------ #
     #  Data access
@@ -364,7 +368,7 @@ class SimpleDataSet(Dataset):
                 file_idx = self._index_map[rand_virtual]
                 data_line = self._all_lines[file_idx]
             else:
-                file_idx = self.data_idx_order_list[np.random.randint(self.__len__())]
+                file_idx = self.data_idx_order_list[np.random.randint(len(self.data_idx_order_list))]
                 data_line = self.data_lines[file_idx]
             data_line = data_line.decode("utf-8")
             substr = data_line.strip("\n").split(self.delimiter)
@@ -441,7 +445,6 @@ class SimpleDataSet(Dataset):
         if self._index_map is not None:
             return len(self._index_map)
         return len(self.data_idx_order_list)
-
 
 class MultiScaleDataSet(SimpleDataSet):
     def __init__(self, config, mode, logger, seed=None):
@@ -541,4 +544,252 @@ class MultiScaleDataSet(SimpleDataSet):
             # during evaluation, we should fix the idx to get same results for many times of evaluation.
             rnd_idx = (idx + 1) % self.__len__()
             return self.__getitem__([img_width, img_height, rnd_idx, wh_ratio])
+        return outs
+
+class MultiScaleNumericallyAugmentedDataSet(MultiScaleDataSet):
+    """
+    MultiScaleDataSet + numeric-sample augmentation, ported from the
+    numeric-mixing logic in TextlineDataset (from our TrOCR script).
+ 
+    Numeric samples come from two sources, interleaved every Nth slot:
+      - synthetic, generated on the fly via generate_sample_image()
+      - "additional" real numeric samples, read from separate label file(s)
+        (e.g. the UoS numeric data), wrapped around deterministically using
+        the dataset's shared epoch counter so successive epochs walk
+        through the additional data without repeating early.
+ 
+    New dataset_config keys (config[mode]["dataset"]):
+        numeric_proportion (float, default 0.0)
+            Proportion of numeric samples relative to the real dataset size.
+        numeric_replaces_text (bool, default False)
+            True  -> numeric samples replace the first `count_numeric` real
+                     samples (dataset length unchanged).
+            False -> numeric samples are appended (dataset grows).
+        numeric_every_nth_synthetic (int, default 3)
+            Every Nth numeric slot is synthetic; the rest are drawn from
+            additional_numeric_label_file_list.
+        additional_numeric_label_file_list (str | list[str], default [])
+            Label file(s), same `delimiter` format as label_file_list,
+            containing the real additional numeric samples. Required unless
+            numeric_every_nth_synthetic == 1 (i.e. every numeric sample is
+            synthetic).
+        sd19_index_file / sd19_backgrounds_dir / sd19_curated_dir /
+        sd19_dida_dir
+            Paths forwarded to generate_sample_image().
+    """
+ 
+    def __init__(self, config, mode, logger, seed=None):
+        super(MultiScaleNumericallyAugmentedDataSet, self).__init__(config, mode, logger, seed)
+ 
+        dataset_config = config[mode]["dataset"]
+ 
+        self.numeric_proportion = dataset_config.get("numeric_proportion", 0.0)
+        self.numeric_replaces_text = dataset_config.get("numeric_replaces_text", False)
+        self.numeric_every_nth_synthetic = max(
+            int(dataset_config.get("numeric_every_nth_synthetic", 3)), 1
+        )
+ 
+        self.sd19_index_file = Path(dataset_config.get("sd19_index_file", "/tmp/sd19/sd19.pkl"))
+        self.sd19_backgrounds_dir = Path(dataset_config.get("sd19_backgrounds_dir", "/tmp/gen/backgrounds"))
+        self.sd19_curated_dir = Path(dataset_config.get("sd19_curated_dir", "/tmp/gen/curated"))
+        self.sd19_dida_dir = Path(dataset_config.get("sd19_dida_dir", "/tmp/gen/dida_segmented"))
+ 
+        additional_label_file_list = dataset_config.get("additional_numeric_label_file_list", [])
+        if isinstance(additional_label_file_list, str):
+            additional_label_file_list = [additional_label_file_list]
+        self.additional_numeric_label_file_list = additional_label_file_list
+ 
+        # Length of the "real" dataset as reported by the parent classes,
+        # captured once (the ratio-based index map is regenerated per epoch
+        # but its size is stable across epochs).
+        self._real_len = super(MultiScaleNumericallyAugmentedDataSet, self).__len__()
+ 
+        if self.numeric_proportion > 0.0 and self.numeric_replaces_text:
+            self.count_numeric = int(self._real_len * self.numeric_proportion)
+            self.logger.info(
+                "Numeric augmentation: replacing %d real samples with numeric samples"
+                % self.count_numeric
+            )
+        elif self.numeric_proportion > 0.0:
+            self.count_numeric = int(
+                (self._real_len * self.numeric_proportion) / (1 - self.numeric_proportion)
+            )
+            self.logger.info(
+                "Numeric augmentation: adding %d numeric samples" % self.count_numeric
+            )
+            self.logger.info(
+                "We have %d real samples"
+                % self._real_len
+            )
+        else:
+            self.count_numeric = 0
+ 
+        # Number of synthetic vs. additional-real numeric slots per epoch.
+        self.count_synthetic_per_epoch = (
+            self.count_numeric + self.numeric_every_nth_synthetic - 1
+        ) // self.numeric_every_nth_synthetic
+        self.count_additional_per_epoch = self.count_numeric - self.count_synthetic_per_epoch
+ 
+        # Pre-load the additional-numeric label lines (kept simple/eager,
+        # unlike the lazy URL-prefetching main dataset -- these are meant to
+        # be a small, local, real numeric-sample corpus).
+        self._additional_numeric_lines = []
+        if self.count_numeric > 0 and self.count_additional_per_epoch > 0:
+            if not self.additional_numeric_label_file_list:
+                raise ValueError(
+                    "additional_numeric_label_file_list is required when "
+                    "numeric_proportion > 0 and numeric_every_nth_synthetic "
+                    "does not make every numeric sample synthetic."
+                )
+            for f in self.additional_numeric_label_file_list:
+                with open(f, "rb") as fh:
+                    self._additional_numeric_lines.extend(fh.readlines())
+            if len(self._additional_numeric_lines) == 0:
+                raise ValueError("additional_numeric_label_file_list resolved to zero lines.")
+ 
+        if self.count_numeric > 0 and self.count_synthetic_per_epoch > 0 and generate_sample_image is None:
+            self.logger.warning(
+                "sd19_alphanumeric_line_generator_seek could not be imported; "
+                "synthetic numeric generation will fail if requested."
+            )
+
+        if self.mode == "train":
+            rng = random.Random()
+            rng.shuffle(self._additional_numeric_lines)
+
+        self._additional_counter = multiprocessing.Value("q", 0)
+        
+        rank = int(os.environ.get("PADDLE_TRAINER_ID", 0))
+
+        # Main dataset: should be IDENTICAL across all ranks
+        main_line = self.data_lines[0].decode("utf-8").strip()
+        print(f"[RANK {rank}] MAIN[0]: {main_line}", flush=True)
+        
+        # Additional numeric dataset: should normally be DIFFERENT across ranks
+        if self._additional_numeric_lines:
+            additional_line = self._additional_numeric_lines[0].decode("utf-8").strip()
+            print(f"[RANK {rank}] ADDITIONAL[0]: {additional_line}", flush=True)
+
+
+    # ------------------------------------------------------------------ #
+    #  Length
+    # ------------------------------------------------------------------ #
+ 
+    def __len__(self):
+        if self.numeric_replaces_text:
+            return self._real_len
+        return self._real_len + self.count_numeric
+ 
+    # ------------------------------------------------------------------ #
+    #  Numeric-sample helpers
+    # ------------------------------------------------------------------ #
+ 
+    def _is_numeric_idx(self, idx):
+        if self.numeric_replaces_text:
+            return idx < self.count_numeric
+        return idx >= self._real_len
+ 
+    def _get_additional_numeric_line(self, numeric_idx):
+        n = len(self._additional_numeric_lines)
+        if self.mode == "train":
+            # Walk through the file continuously across epochs and workers.
+            with self._additional_counter.get_lock():
+                i = self._additional_counter.value
+                self._additional_counter.value = i + 1
+            additional_idx = i % n
+        else:
+            # Eval stays deterministic.
+            additional_idx = (
+                numeric_idx - (numeric_idx // self.numeric_every_nth_synthetic) - 1
+            ) % n
+        return self._additional_numeric_lines[additional_idx]
+ 
+    def _build_numeric_data(self, idx, numeric_idx):
+        """Return (img_path, label, image_bytes) for a numeric sample,
+        sourced either from the synthetic generator or the additional
+        real-numeric label lines."""
+        if numeric_idx % self.numeric_every_nth_synthetic == 0:
+            if generate_sample_image is None:
+                raise RuntimeError(
+                    "generate_sample_image is unavailable; cannot build synthetic numeric sample."
+                )
+            # Deterministic seed for eval (repeatable metrics across runs),
+            # random for train (mirrors TextlineDataset's `if not augment`).
+            seed = idx if self.mode != "train" else None
+            pil_image, text = generate_sample_image(
+                seed=seed,
+                sd19_index_file=self.sd19_index_file,
+                backgrounds_dir=self.sd19_backgrounds_dir,
+                curated_dir=self.sd19_curated_dir,
+                dida_dir=self.sd19_dida_dir,
+            )
+            buf = io.BytesIO()
+            pil_image.convert("RGB").save(buf, format="PNG")
+            image_bytes = buf.getvalue()
+            img_path = "<synthetic_numeric_%d>" % idx
+            label = text
+        else:
+            data_line = self._get_additional_numeric_line(numeric_idx).decode("utf-8")
+            substr = data_line.strip("\n").split(self.delimiter)
+            file_name = self._try_parse_filename_list(substr[0])
+            label = substr[1] if len(substr) > 1 else ""
+            img_path = (
+                file_name
+                if file_name.startswith("http://") or file_name.startswith("https://")
+                else os.path.join(self.data_dir, file_name)
+            )
+            if not _img_path_exists(img_path):
+                raise Exception("{} does not exist!".format(img_path))
+            image_bytes = _load_image_bytes(img_path)
+ 
+        return img_path, label, image_bytes
+ 
+    # ------------------------------------------------------------------ #
+    #  __getitem__ override
+    # ------------------------------------------------------------------ #
+ 
+    def __getitem__(self, properties):
+        # properties is (width, height, idx[, wh_ratio]) -- same contract as
+        # MultiScaleDataSet.__getitem__.
+        img_height = properties[1]
+        idx = properties[2]
+ 
+        if not self._is_numeric_idx(idx):
+            return super(MultiScaleNumericallyAugmentedDataSet, self).__getitem__(properties)
+ 
+        numeric_idx = idx if self.numeric_replaces_text else idx - self._real_len
+ 
+        if self.ds_width and len(properties) > 3 and properties[3] is not None:
+            wh_ratio = properties[3]
+            img_width = img_height * (1 if int(round(wh_ratio)) == 0 else int(round(wh_ratio)))
+        else:
+            img_width = properties[0]
+            wh_ratio = None
+ 
+        try:
+            img_path, label, image_bytes = self._build_numeric_data(idx, numeric_idx)
+            data = {"img_path": img_path, "label": label, "image": image_bytes}
+            data["ext_data"] = self.get_ext_data()
+            outs = transform(data, self.ops[:-1])
+            if outs is not None:
+                outs = self.resize_norm_img(outs, img_width, img_height)
+                outs = transform(outs, self.ops[-1:])
+        except Exception:
+            self.logger.error(
+                "When building numeric sample idx={}, error happened with msg: {}".format(
+                    idx, traceback.format_exc()
+                )
+            )
+            outs = None
+ 
+        if outs is None:
+            # Same "fix idx deterministically for eval" behaviour as the
+            # parent classes.
+            rnd_idx = (
+                np.random.randint(self.__len__())
+                if self.mode == "train"
+                else (idx + 1) % self.__len__()
+            )
+            return self.__getitem__([img_width, img_height, rnd_idx, wh_ratio])
+ 
         return outs

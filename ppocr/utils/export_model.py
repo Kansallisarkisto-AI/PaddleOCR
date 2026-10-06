@@ -193,7 +193,7 @@ def dynamic_to_static(model, arch_config, logger, input_shape=None):
         model = to_static(model, input_spec=other_shape)
     elif arch_config["algorithm"] in ["SVTR_LCNet", "SVTR_HGNet"]:
         other_shape = [
-            paddle.static.InputSpec(shape=[None, 3, 48, -1], dtype="float32"),
+            paddle.static.InputSpec(shape=[None, 3, 96, -1], dtype="float32"), # was 48
         ]
         model = to_static(model, input_spec=other_shape)
     elif arch_config["algorithm"] in ["SVTR", "CPPD"]:
